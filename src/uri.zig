@@ -24,7 +24,7 @@ pub fn fromPath(allocator: *std.mem.Allocator, path: []const u8) ![]const u8 {
             try buf.append('%');
             try std.fmt.format(out_stream, "{X}", .{char});
         } else {
-            try buf.append(std.ascii.toLower(char));
+            try buf.append(char);
         }
     }
 
