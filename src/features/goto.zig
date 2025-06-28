@@ -23,6 +23,48 @@ pub const GotoKind = enum {
     type_definition,
 };
 
+const SourceLocation = struct {
+    file_path: []const u8,
+    line: u32,
+    column: u32,
+};
+
+/// Parses a source location from doc comments in the format "Source: <file_path>:<line>:<column>"
+fn parseSourceLocation(allocator: std.mem.Allocator, doc_comments: []const u8) ?SourceLocation {
+    var lines = std.mem.tokenizeScalar(u8, doc_comments, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "Source:")) {
+            const source_str = std.mem.trim(u8, trimmed["Source:".len..], " \t");
+
+            // Find the last colon to separate column
+            const last_colon = std.mem.lastIndexOfScalar(u8, source_str, ':') orelse return null;
+            const column_str = source_str[last_colon + 1 ..];
+            const column = std.fmt.parseInt(u32, column_str, 10) catch return null;
+
+            // Find the second-to-last colon to separate line
+            const path_and_line = source_str[0..last_colon];
+            const second_last_colon = std.mem.lastIndexOfScalar(u8, path_and_line, ':') orelse return null;
+            const line_str = path_and_line[second_last_colon + 1 ..];
+            const line_num = std.fmt.parseInt(u32, line_str, 10) catch return null;
+
+            // The rest is the file path
+            const file_path = path_and_line[0..second_last_colon];
+
+            // Make a copy of the file path since we're returning it
+            const file_path_copy = allocator.dupe(u8, file_path) catch return null;
+
+            // LSP uses 0-based line and column indices
+            return SourceLocation{
+                .file_path = file_path_copy,
+                .line = if (line_num > 0) line_num - 1 else 0,
+                .column = if (column > 0) column - 1 else 0,
+            };
+        }
+    }
+    return null;
+}
+
 fn gotoDefinitionSymbol(
     analyser: *Analyser,
     name_range: types.Range,
@@ -51,6 +93,30 @@ fn gotoDefinitionSymbol(
             };
         },
     };
+
+    // Check if the declaration has a doc comment with "Source: <file_path>:<line>:<column>"
+    if (try decl_handle.docComments(analyser.arena.allocator())) |doc_comments| {
+        if (parseSourceLocation(analyser.arena.allocator(), doc_comments)) |source_info| {
+            // Navigate to the source location instead of the declaration
+            const target_uri = try URI.fromPath(analyser.arena.allocator(), source_info.file_path);
+            const target_position: types.Position = .{
+                .line = source_info.line,
+                .character = source_info.column,
+            };
+            const target_range: types.Range = .{
+                .start = target_position,
+                .end = target_position,
+            };
+
+            return .{
+                .originSelectionRange = name_range,
+                .targetUri = target_uri,
+                .targetRange = target_range,
+                .targetSelectionRange = target_range,
+            };
+        }
+    }
+
     const target_range = offsets.tokenToRange(token_handle.handle.tree, token_handle.token, offset_encoding);
 
     return .{
