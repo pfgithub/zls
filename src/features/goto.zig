@@ -23,43 +23,13 @@ pub const GotoKind = enum {
     type_definition,
 };
 
-const SourceLocation = struct {
-    file_path: []const u8,
-    line: u32,
-    column: u32,
-};
-
-/// Parses a source location from doc comments in the format "Source: <file_path>:<line>:<column>"
-fn parseSourceLocation(allocator: std.mem.Allocator, doc_comments: []const u8) ?SourceLocation {
+/// Parses a source location from doc comments in the format "Source: <search_string>"
+fn parseSourceTarget(doc_comments: []const u8) ?[]const u8 {
     var lines = std.mem.tokenizeScalar(u8, doc_comments, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t");
         if (std.mem.startsWith(u8, trimmed, "Source:")) {
-            const source_str = std.mem.trim(u8, trimmed["Source:".len..], " \t");
-
-            // Find the last colon to separate column
-            const last_colon = std.mem.lastIndexOfScalar(u8, source_str, ':') orelse return null;
-            const column_str = source_str[last_colon + 1 ..];
-            const column = std.fmt.parseInt(u32, column_str, 10) catch return null;
-
-            // Find the second-to-last colon to separate line
-            const path_and_line = source_str[0..last_colon];
-            const second_last_colon = std.mem.lastIndexOfScalar(u8, path_and_line, ':') orelse return null;
-            const line_str = path_and_line[second_last_colon + 1 ..];
-            const line_num = std.fmt.parseInt(u32, line_str, 10) catch return null;
-
-            // The rest is the file path
-            const file_path = path_and_line[0..second_last_colon];
-
-            // Make a copy of the file path since we're returning it
-            const file_path_copy = allocator.dupe(u8, file_path) catch return null;
-
-            // LSP uses 0-based line and column indices
-            return SourceLocation{
-                .file_path = file_path_copy,
-                .line = if (line_num > 0) line_num - 1 else 0,
-                .column = if (column > 0) column - 1 else 0,
-            };
+            return std.mem.trim(u8, trimmed["Source:".len..], " \t");
         }
     }
     return null;
@@ -67,6 +37,7 @@ fn parseSourceLocation(allocator: std.mem.Allocator, doc_comments: []const u8) ?
 
 fn gotoDefinitionSymbol(
     analyser: *Analyser,
+    arena: std.mem.Allocator,
     name_range: types.Range,
     decl_handle: Analyser.DeclWithHandle,
     kind: GotoKind,
@@ -94,26 +65,48 @@ fn gotoDefinitionSymbol(
         },
     };
 
-    // Check if the declaration has a doc comment with "Source: <file_path>:<line>:<column>"
-    if (try decl_handle.docComments(analyser.arena.allocator())) |doc_comments| {
-        if (parseSourceLocation(analyser.arena.allocator(), doc_comments)) |source_info| {
-            // Navigate to the source location instead of the declaration
-            const target_uri = try URI.fromPath(analyser.arena.allocator(), source_info.file_path);
-            const target_position: types.Position = .{
-                .line = source_info.line,
-                .character = source_info.column,
-            };
-            const target_range: types.Range = .{
-                .start = target_position,
-                .end = target_position,
-            };
+    if (try decl_handle.docComments(arena)) |doc_comments| blk: {
+        if (parseSourceTarget(doc_comments)) |source_info| {
+            const src_path = URI.parse(arena, decl_handle.handle.uri) catch break :blk;
+            const base = std.fs.path.dirname(src_path) orelse "/";
 
-            return .{
-                .originSelectionRange = name_range,
-                .targetUri = target_uri,
-                .targetRange = target_range,
-                .targetSelectionRange = target_range,
-            };
+            const last_dot = std.mem.lastIndexOfScalar(u8, src_path, '.') orelse break :blk;
+            const without_extension = src_path[0 .. last_dot + 1];
+            const absolute_source_links_path = try std.fmt.allocPrint(arena, "{s}source-links", .{without_extension});
+            const absolute_source_links_uri = try URI.fromPath(arena, absolute_source_links_path);
+            const absolute_source_links_handle = analyser.store.getOrLoadHandle(absolute_source_links_uri) orelse break :blk;
+            var lines = std.mem.tokenizeAny(u8, absolute_source_links_handle.tree.source, &.{ '\r', '\n' });
+            while (lines.next()) |line| {
+                var segments = std.mem.tokenizeScalar(u8, line, ':');
+                const match = segments.next() orelse continue;
+                if (std.mem.eql(u8, match, source_info)) {
+                    const target_file = segments.next() orelse continue;
+                    const target_line = segments.next() orelse continue;
+                    const target_column = segments.next() orelse continue;
+                    var line_num = std.fmt.parseInt(u32, target_line, 10) catch continue;
+                    var column_num = std.fmt.parseInt(u32, target_column, 10) catch continue;
+                    line_num -|= 1;
+                    column_num -|= 1;
+
+                    const absolute_src_path = try std.fs.path.join(arena, &.{ base, target_file });
+                    const target_uri = try URI.fromPath(arena, absolute_src_path);
+
+                    const target_position: types.Position = .{
+                        .line = line_num,
+                        .character = column_num,
+                    };
+                    const target_range: types.Range = .{
+                        .start = target_position,
+                        .end = target_position,
+                    };
+                    return .{
+                        .originSelectionRange = name_range,
+                        .targetUri = target_uri,
+                        .targetRange = target_range,
+                        .targetSelectionRange = target_range,
+                    };
+                }
+            }
         }
     }
 
@@ -129,6 +122,7 @@ fn gotoDefinitionSymbol(
 
 fn gotoDefinitionLabel(
     analyser: *Analyser,
+    arena: std.mem.Allocator,
     handle: *DocumentStore.Handle,
     pos_index: usize,
     loc: offsets.Loc,
@@ -141,11 +135,12 @@ fn gotoDefinitionLabel(
     const name_loc = Analyser.identifierLocFromIndex(handle.tree, pos_index) orelse return null;
     const name = offsets.locToSlice(handle.tree.source, name_loc);
     const decl = (try Analyser.lookupLabel(handle, name, pos_index)) orelse return null;
-    return try gotoDefinitionSymbol(analyser, offsets.locToRange(handle.tree.source, loc, offset_encoding), decl, kind, offset_encoding);
+    return try gotoDefinitionSymbol(analyser, arena, offsets.locToRange(handle.tree.source, loc, offset_encoding), decl, kind, offset_encoding);
 }
 
 fn gotoDefinitionGlobal(
     analyser: *Analyser,
+    arena: std.mem.Allocator,
     handle: *DocumentStore.Handle,
     pos_index: usize,
     kind: GotoKind,
@@ -157,7 +152,7 @@ fn gotoDefinitionGlobal(
     const name_loc = Analyser.identifierLocFromIndex(handle.tree, pos_index) orelse return null;
     const name = offsets.locToSlice(handle.tree.source, name_loc);
     const decl = (try analyser.lookupSymbolGlobal(handle, name, pos_index)) orelse return null;
-    return try gotoDefinitionSymbol(analyser, offsets.locToRange(handle.tree.source, name_loc, offset_encoding), decl, kind, offset_encoding);
+    return try gotoDefinitionSymbol(analyser, arena, offsets.locToRange(handle.tree.source, name_loc, offset_encoding), decl, kind, offset_encoding);
 }
 
 fn gotoDefinitionEnumLiteral(
@@ -174,7 +169,7 @@ fn gotoDefinitionEnumLiteral(
     const name_loc = Analyser.identifierLocFromIndex(handle.tree, source_index) orelse return null;
     const name = offsets.locToSlice(handle.tree.source, name_loc);
     const decl = (try analyser.getSymbolEnumLiteral(arena, handle, source_index, name)) orelse return null;
-    return try gotoDefinitionSymbol(analyser, offsets.locToRange(handle.tree.source, name_loc, offset_encoding), decl, kind, offset_encoding);
+    return try gotoDefinitionSymbol(analyser, arena, offsets.locToRange(handle.tree.source, name_loc, offset_encoding), decl, kind, offset_encoding);
 }
 
 fn gotoDefinitionBuiltin(
@@ -234,7 +229,7 @@ fn gotoDefinitionFieldAccess(
     var locs: std.ArrayListUnmanaged(types.DefinitionLink) = .empty;
 
     for (accesses) |access| {
-        if (try gotoDefinitionSymbol(analyser, offsets.locToRange(handle.tree.source, name_loc, offset_encoding), access, kind, offset_encoding)) |l|
+        if (try gotoDefinitionSymbol(analyser, arena, offsets.locToRange(handle.tree.source, name_loc, offset_encoding), access, kind, offset_encoding)) |l|
             try locs.append(arena, l);
     }
 
@@ -313,7 +308,7 @@ pub fn gotoHandler(
 
     const response = switch (pos_context) {
         .builtin => |loc| try gotoDefinitionBuiltin(&server.document_store, handle, loc, server.offset_encoding),
-        .var_access => try gotoDefinitionGlobal(&analyser, handle, source_index, kind, server.offset_encoding),
+        .var_access => try gotoDefinitionGlobal(&analyser, arena, handle, source_index, kind, server.offset_encoding),
         .field_access => |loc| blk: {
             const links = try gotoDefinitionFieldAccess(&analyser, arena, handle, source_index, loc, kind, server.offset_encoding) orelse return null;
             if (server.client_capabilities.supports_textDocument_definition_linkSupport) {
@@ -329,7 +324,7 @@ pub fn gotoHandler(
         .cinclude_string_literal,
         .embedfile_string_literal,
         => try gotoDefinitionString(&server.document_store, arena, pos_context, handle, server.offset_encoding),
-        .label_access, .label_decl => |loc| try gotoDefinitionLabel(&analyser, handle, source_index, loc, kind, server.offset_encoding),
+        .label_access, .label_decl => |loc| try gotoDefinitionLabel(&analyser, arena, handle, source_index, loc, kind, server.offset_encoding),
         .enum_literal => try gotoDefinitionEnumLiteral(&analyser, arena, handle, source_index, kind, server.offset_encoding),
         else => null,
     } orelse return null;
