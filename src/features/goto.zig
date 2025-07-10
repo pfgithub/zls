@@ -73,9 +73,8 @@ fn gotoDefinitionSymbol(
             const last_dot = std.mem.lastIndexOfScalar(u8, src_path, '.') orelse break :blk;
             const without_extension = src_path[0 .. last_dot + 1];
             const absolute_source_links_path = try std.fmt.allocPrint(arena, "{s}source-links", .{without_extension});
-            const absolute_source_links_uri = try URI.fromPath(arena, absolute_source_links_path);
-            const absolute_source_links_handle = analyser.store.getOrLoadHandle(absolute_source_links_uri) orelse break :blk;
-            var lines = std.mem.tokenizeAny(u8, absolute_source_links_handle.tree.source, &.{ '\r', '\n' });
+            const absolute_source_links_contents = std.fs.cwd().readFileAlloc(arena, absolute_source_links_path, std.math.maxInt(usize)) catch break :blk;
+            var lines = std.mem.tokenizeAny(u8, absolute_source_links_contents, &.{ '\r', '\n' });
             while (lines.next()) |line| {
                 var segments = std.mem.tokenizeScalar(u8, line, ':');
                 const match = segments.next() orelse continue;
