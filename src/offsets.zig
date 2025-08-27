@@ -225,7 +225,7 @@ fn identifierIndexToLoc(tree: Ast, source_index: usize) Loc {
     } else {
         while (true) : (index += 1) {
             switch (tree.source[index]) {
-                'a'...'z', 'A'...'Z', '_', '0'...'9' => {},
+                'a'...'z', 'A'...'Z', '_', '#', '0'...'9' => {},
                 else => break,
             }
         }
@@ -253,7 +253,7 @@ pub fn identifierIndexToNameLoc(text: [:0]const u8, source_index: usize) Loc {
         var index = start;
         while (true) : (index += 1) {
             switch (text[index]) {
-                'a'...'z', 'A'...'Z', '_', '0'...'9' => {},
+                'a'...'z', 'A'...'Z', '_', '#', '0'...'9' => {},
                 else => break,
             }
         }
