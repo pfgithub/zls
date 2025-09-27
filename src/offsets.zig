@@ -238,7 +238,7 @@ pub fn identifierIndexToLoc(text: [:0]const u8, source_index: usize, range: Iden
         var index = start;
         while (true) : (index += 1) {
             switch (text[index]) {
-                'a'...'z', 'A'...'Z', '_', '0'...'9' => {},
+                'a'...'z', 'A'...'Z', '_', '#', '0'...'9' => {},
                 else => break,
             }
         }

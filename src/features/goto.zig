@@ -23,8 +23,21 @@ pub const GotoKind = enum {
     type_definition,
 };
 
+/// Parses a source location from doc comments in the format "Source: <search_string>"
+fn parseSourceTarget(doc_comments: []const u8) ?[]const u8 {
+    var lines = std.mem.tokenizeScalar(u8, doc_comments, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "Source:")) {
+            return std.mem.trim(u8, trimmed["Source:".len..], " \t");
+        }
+    }
+    return null;
+}
+
 fn gotoDefinitionSymbol(
     analyser: *Analyser,
+    arena: std.mem.Allocator,
     name_range: types.Range,
     decl_handle: Analyser.DeclWithHandle,
     kind: GotoKind,
@@ -58,6 +71,51 @@ fn gotoDefinitionSymbol(
             };
         },
     };
+
+    if (try decl_handle.docComments(arena)) |doc_comments| blk: {
+        if (parseSourceTarget(doc_comments)) |source_info| {
+            const src_path = URI.toFsPath(arena, decl_handle.handle.uri) catch break :blk;
+            const base = std.fs.path.dirname(src_path) orelse "/";
+
+            const last_dot = std.mem.lastIndexOfScalar(u8, src_path, '.') orelse break :blk;
+            const without_extension = src_path[0 .. last_dot + 1];
+            const absolute_source_links_path = try std.fmt.allocPrint(arena, "{s}source-links", .{without_extension});
+            const absolute_source_links_contents = std.fs.cwd().readFileAlloc(arena, absolute_source_links_path, std.math.maxInt(usize)) catch break :blk;
+            var lines = std.mem.tokenizeAny(u8, absolute_source_links_contents, &.{ '\r', '\n' });
+            while (lines.next()) |line| {
+                var segments = std.mem.tokenizeScalar(u8, line, ':');
+                const match = segments.next() orelse continue;
+                if (std.mem.eql(u8, match, source_info)) {
+                    const target_file = segments.next() orelse continue;
+                    const target_line = segments.next() orelse continue;
+                    const target_column = segments.next() orelse continue;
+                    var line_num = std.fmt.parseInt(u32, target_line, 10) catch continue;
+                    var column_num = std.fmt.parseInt(u32, target_column, 10) catch continue;
+                    line_num -|= 1;
+                    column_num -|= 1;
+
+                    const absolute_src_path = try std.fs.path.join(arena, &.{ base, target_file });
+                    const target_uri = try URI.fromPath(arena, absolute_src_path);
+
+                    const target_position: types.Position = .{
+                        .line = line_num,
+                        .character = column_num,
+                    };
+                    const target_range: types.Range = .{
+                        .start = target_position,
+                        .end = target_position,
+                    };
+                    return .{
+                        .originSelectionRange = name_range,
+                        .targetUri = target_uri,
+                        .targetRange = target_range,
+                        .targetSelectionRange = target_range,
+                    };
+                }
+            }
+        }
+    }
+
     const target_range = offsets.tokenToRange(token_handle.handle.tree, token_handle.token, offset_encoding);
 
     return .{
@@ -70,6 +128,7 @@ fn gotoDefinitionSymbol(
 
 fn gotoDefinitionLabel(
     analyser: *Analyser,
+    arena: std.mem.Allocator,
     handle: *DocumentStore.Handle,
     pos_index: usize,
     loc: offsets.Loc,
@@ -82,11 +141,12 @@ fn gotoDefinitionLabel(
     const name_loc = Analyser.identifierLocFromIndex(handle.tree, pos_index) orelse return null;
     const name = offsets.locToSlice(handle.tree.source, name_loc);
     const decl = (try Analyser.lookupLabel(handle, name, pos_index)) orelse return null;
-    return try gotoDefinitionSymbol(analyser, offsets.locToRange(handle.tree.source, loc, offset_encoding), decl, kind, offset_encoding);
+    return try gotoDefinitionSymbol(analyser, arena, offsets.locToRange(handle.tree.source, loc, offset_encoding), decl, kind, offset_encoding);
 }
 
 fn gotoDefinitionGlobal(
     analyser: *Analyser,
+    arena: std.mem.Allocator,
     handle: *DocumentStore.Handle,
     pos_index: usize,
     kind: GotoKind,
@@ -98,7 +158,7 @@ fn gotoDefinitionGlobal(
     const name_token, const name_loc = Analyser.identifierTokenAndLocFromIndex(handle.tree, pos_index) orelse return null;
     const name = offsets.locToSlice(handle.tree.source, name_loc);
     const decl = (try analyser.lookupSymbolGlobal(handle, name, pos_index)) orelse return null;
-    return try gotoDefinitionSymbol(analyser, offsets.tokenToRange(handle.tree, name_token, offset_encoding), decl, kind, offset_encoding);
+    return try gotoDefinitionSymbol(analyser, arena, offsets.tokenToRange(handle.tree, name_token, offset_encoding), decl, kind, offset_encoding);
 }
 
 fn gotoDefinitionStructInit(
@@ -130,6 +190,7 @@ fn gotoDefinitionStructInit(
 
 fn gotoDefinitionEnumLiteral(
     analyser: *Analyser,
+    arena: std.mem.Allocator,
     handle: *DocumentStore.Handle,
     source_index: usize,
     kind: GotoKind,
@@ -143,7 +204,7 @@ fn gotoDefinitionEnumLiteral(
     };
     const name = offsets.locToSlice(handle.tree.source, name_loc);
     const decl = (try analyser.getSymbolEnumLiteral(handle, source_index, name)) orelse return null;
-    return try gotoDefinitionSymbol(analyser, offsets.tokenToRange(handle.tree, name_token, offset_encoding), decl, kind, offset_encoding);
+    return try gotoDefinitionSymbol(analyser, arena, offsets.tokenToRange(handle.tree, name_token, offset_encoding), decl, kind, offset_encoding);
 }
 
 fn gotoDefinitionBuiltin(
@@ -216,7 +277,7 @@ fn gotoDefinitionFieldAccess(
     var locs: std.ArrayList(types.DefinitionLink) = .empty;
 
     for (accesses) |access| {
-        if (try gotoDefinitionSymbol(analyser, offsets.tokenToRange(handle.tree, name_token, offset_encoding), access, kind, offset_encoding)) |l|
+        if (try gotoDefinitionSymbol(analyser, arena, offsets.tokenToRange(handle.tree, name_token, offset_encoding), access, kind, offset_encoding)) |l|
             try locs.append(arena, l);
     }
 
@@ -295,7 +356,7 @@ pub fn gotoHandler(
 
     const response = switch (pos_context) {
         .builtin => |loc| try gotoDefinitionBuiltin(&analyser, handle, loc, server.offset_encoding),
-        .var_access => try gotoDefinitionGlobal(&analyser, handle, source_index, kind, server.offset_encoding),
+        .var_access => try gotoDefinitionGlobal(&analyser, arena, handle, source_index, kind, server.offset_encoding),
         .field_access => |loc| blk: {
             const links = try gotoDefinitionFieldAccess(&analyser, arena, handle, source_index, loc, kind, server.offset_encoding) orelse return null;
             if (server.client_capabilities.supports_textDocument_definition_linkSupport) {
@@ -311,8 +372,8 @@ pub fn gotoHandler(
         .cinclude_string_literal,
         .embedfile_string_literal,
         => try gotoDefinitionString(&server.document_store, arena, pos_context, handle, server.offset_encoding),
-        .label_access, .label_decl => |loc| try gotoDefinitionLabel(&analyser, handle, source_index, loc, kind, server.offset_encoding),
-        .enum_literal => try gotoDefinitionEnumLiteral(&analyser, handle, source_index, kind, server.offset_encoding),
+        .label_access, .label_decl => |loc| try gotoDefinitionLabel(&analyser, arena, handle, source_index, loc, kind, server.offset_encoding),
+        .enum_literal => try gotoDefinitionEnumLiteral(&analyser, arena, handle, source_index, kind, server.offset_encoding),
         else => null,
     } orelse return null;
 
